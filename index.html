@@ -91,12 +91,22 @@ $('go').addEventListener('click', async () => {
     const input = new Decoder(Stream.fromArrayBuffer(buffer));
     if (!input.isFIT() || !input.checkIntegrity()) throw new Error('This file is not a valid FIT file, or its checksum failed.');
     const ordered = [];
+    // Decode with the SDK's normal scaled values (the Encoder re-applies scaling itself),
+    // but keep sub-fields/components unexpanded and keep unknown fields so the data round-trips.
     const result = input.read({
+      applyScaleAndOffset: true,
+      expandSubFields: false,
+      expandComponents: false,
+      convertTypesToStrings: true,
+      convertDateTimesToDates: true,
+      includeUnknownData: true,
+      mergeHeartRates: false,
       mesgListener: (mesgNum, message) => ordered.push({mesgNum, message})
     });
     if (result.errors?.length) throw new Error('FIT decoding reported: ' + result.errors.join('; '));
     const encoder = new Encoder();
-    let removedGps = 0, removedPrivate = 0, written = 0;
+    let removedGps = 0, removedPrivate = 0, written = 0, skipped = 0;
+    const devIds = {};
     for (const item of ordered) {
       const type = Profile.types?.mesgNum?.[item.mesgNum] || '';
       if ($('personal').checked && type === 'userProfile') { removedPrivate++; continue; }
@@ -108,8 +118,26 @@ $('go').addEventListener('click', async () => {
       if ($('personal').checked) {
         for (const k of privateFields) if (Object.prototype.hasOwnProperty.call(item.message,k) && !Object.prototype.hasOwnProperty.call(clean,k)) removedPrivate++;
       }
-      encoder.onMesg(item.mesgNum, clean);
-      written++;
+      try {
+        if (item.mesgNum === 207) devIds[clean.developerDataIndex] = clean;
+        encoder.onMesg(item.mesgNum, clean);
+        // Developer fields (e.g. Stryd/Coros app data) must be registered with the encoder.
+        if (item.mesgNum === 206 && devIds[clean.developerDataIndex]) {
+          encoder.addDeveloperField(clean.key, devIds[clean.developerDataIndex], clean);
+        }
+        written++;
+      } catch (err1) {
+        // Retry without unknown (numeric-key) fields; skip the message if it still fails.
+        const known = {};
+        for (const [k, v] of Object.entries(clean)) if (!/^\d+$/.test(k)) known[k] = v;
+        try {
+          encoder.onMesg(item.mesgNum, known);
+          written++;
+        } catch (err2) {
+          skipped++;
+          console.warn('Skipped message', item.mesgNum, type, err2);
+        }
+      }
     }
     const output = encoder.close();
     const outBytes = output instanceof Uint8Array ? output : new Uint8Array(output);
@@ -118,13 +146,17 @@ $('go').addEventListener('click', async () => {
     const blob = new Blob([outBytes], {type:'application/octet-stream'});
     const url = URL.createObjectURL(blob);
     $('download').href = url;
-    $('download').download = selected.name.replace(/\.fit$/i,'') + '-anonymized.fit';
+    // Name the file after the activity start (UTC) so the original filename (often a place name) isn't kept.
+    const pick = n => ordered.find(x => x.mesgNum === n && x.message.startTime instanceof Date)?.message.startTime;
+    const when = pick(18) || pick(19) || ordered.find(x => x.message.timestamp instanceof Date)?.message.timestamp || new Date();
+    const p2 = n => String(n).padStart(2, '0');
+    $('download').download = `${when.getUTCFullYear()}-${p2(when.getUTCMonth()+1)}-${p2(when.getUTCDate())}_${p2(when.getUTCHours())}-${p2(when.getUTCMinutes())}-${p2(when.getUTCSeconds())}.fit`;
     $('download').textContent = 'Save anonymized .FIT';
     $('download').classList.remove('hidden');
-    $('status').textContent = `Done. ${written} messages retained; ${removedGps} GPS fields and ${removedPrivate} personal fields/messages removed. Output integrity check passed.`;
+    $('status').textContent = `Done. ${written} messages retained; ${removedGps} GPS fields and ${removedPrivate} personal fields/messages removed. Output integrity check passed.` + (skipped ? ` ${skipped} unsupported messages were skipped.` : '');
     $('status').className = 'small ok';
   } catch (e) {
-    $('status').textContent = 'Could not anonymize this file: ' + (e?.message || String(e)) + '\\nTry another FIT file or share the error so the tool can be improved.';
+    $('status').textContent = 'Could not anonymize this file: ' + (e?.message || String(e)) + '\nTry another FIT file or share the error so the tool can be improved.';
     $('status').className = 'small err';
   } finally {
     $('go').disabled = !selected;
