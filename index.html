@@ -16,6 +16,11 @@ header{padding:12px 2px 22px}h1{font-size:30px;letter-spacing:-.8px;margin:0 0 8
 button,.download{border:0;border-radius:14px;background:var(--accent);color:#082016;font-weight:750;font-size:16px;padding:15px 18px;width:100%;display:block;text-align:center;text-decoration:none;margin-top:14px}
 button:disabled{opacity:.45}.small{font-size:13px;color:var(--muted);line-height:1.5}.checks{display:grid;gap:10px;margin-top:14px}.checks label{display:flex;gap:10px;align-items:flex-start;line-height:1.35}.checks input{width:19px;height:19px;accent-color:var(--accent);flex:none}
 #status{white-space:pre-wrap;line-height:1.5;margin-top:12px}.ok{color:var(--accent)}.err{color:#ff9b9b}.hidden{display:none}.pill{display:inline-block;background:#20364a;border-radius:99px;padding:5px 9px;font-size:12px;color:#b9d9ee}
+.row{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:10px 0;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}.row .name{min-width:0;flex:1;font-size:14px;line-height:1.35;word-break:break-all}.row .meta{display:block;font-size:12px;color:var(--muted);margin-top:2px;word-break:normal}
+.row .save{flex:none;width:auto;margin:0;padding:9px 13px;font-size:14px;border-radius:11px;background:var(--accent);color:#082016;font-weight:750;text-decoration:none}
+.row.fail .meta{color:#ff9b9b}.row.ok .meta{color:var(--accent)}
+#bar{height:6px;border-radius:9px;background:#20304a;overflow:hidden;margin-top:12px}#bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
 </style>
 </head>
 <body>
@@ -27,17 +32,19 @@ button:disabled{opacity:.45}.small{font-size:13px;color:var(--muted);line-height
 </header>
 <section class="panel">
   <label class="drop">
-    <strong>Choose a .FIT file</strong>
-    <div class="small">Tap to select from Files, iCloud Drive or another location on your iPhone.</div>
-    <input id="file" type="file" accept=".fit,application/octet-stream">
+    <strong>Choose one or more .FIT files</strong>
+    <div class="small">Tap to select from Files, iCloud Drive or another location. Select several files to process them as a batch.</div>
+    <input id="file" type="file" multiple accept=".fit,application/octet-stream">
   </label>
   <div class="checks">
     <label><input id="gps" type="checkbox" checked><span><strong>Remove GPS coordinates</strong><br><span class="small">Activity positions, course points and other recognized location fields.</span></span></label>
     <label><input id="personal" type="checkbox" checked><span><strong>Remove personal/device identifiers</strong><br><span class="small">Serial numbers, device product identifiers and user-profile messages.</span></span></label>
   </div>
-  <button id="go" disabled> Anonymize FIT file </button>
+  <button id="go" disabled> Anonymize FIT files </button>
   <div id="status" class="small" role="status">Choose a file to begin.</div>
-  <a id="download" class="download hidden" download="anonymized.fit">Save anonymized .FIT</a>
+  <div id="bar" class="hidden"><i></i></div>
+  <div id="results"></div>
+  <a id="zip" class="download hidden" download="anonymized-fit-files.zip">Save all as .zip</a>
 </section>
 <section class="panel">
   <strong>What stays?</strong>
@@ -48,14 +55,7 @@ button:disabled{opacity:.45}.small{font-size:13px;color:var(--muted);line-height
 </main>
 <script type="module">
 const $ = id => document.getElementById(id);
-let selected = null;
-$('file').addEventListener('change', () => {
-  selected = $('file').files?.[0] || null;
-  $('go').disabled = !selected;
-  $('download').classList.add('hidden');
-  $('status').textContent = selected ? `${selected.name} · ${(selected.size/1024).toFixed(1)} KB` : 'Choose a file to begin.';
-  $('status').className = 'small';
-});
+let selected = [];
 const gpsFields = new Set([
   'positionLat','positionLong','enhancedPositionLat','enhancedPositionLong',
   'startPositionLat','startPositionLong','endPositionLat','endPositionLong',
@@ -65,6 +65,7 @@ const privateFields = new Set([
   'serialNumber','serialNumber2','productName','friendlyName','userName',
   'firstName','lastName','localId','antDeviceNumber','deviceIndex'
 ]);
+// ==core==
 function cleanMessage(mesgNum, message, Profile, removeGps, removePersonal) {
   const type = Profile.types?.mesgNum?.[mesgNum] || '';
   if (removePersonal && type === 'userProfile') return null;
@@ -78,88 +79,161 @@ function cleanMessage(mesgNum, message, Profile, removeGps, removePersonal) {
   }
   return out;
 }
-$('go').addEventListener('click', async () => {
-  if (!selected) return;
-  $('go').disabled = true;
-  $('download').classList.add('hidden');
-  $('status').textContent = 'Loading FIT tools and processing locally…';
-  $('status').className = 'small';
-  try {
-    const {Decoder, Encoder, Stream, Profile} = await import('https://esm.sh/@garmin/fitsdk');
-    const buffer = await selected.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    const input = new Decoder(Stream.fromArrayBuffer(buffer));
-    if (!input.isFIT() || !input.checkIntegrity()) throw new Error('This file is not a valid FIT file, or its checksum failed.');
-    const ordered = [];
-    // Decode with the SDK's normal scaled values (the Encoder re-applies scaling itself),
-    // but keep sub-fields/components unexpanded and keep unknown fields so the data round-trips.
-    const result = input.read({
-      applyScaleAndOffset: true,
-      expandSubFields: false,
-      expandComponents: false,
-      convertTypesToStrings: true,
-      convertDateTimesToDates: true,
-      includeUnknownData: true,
-      mergeHeartRates: false,
-      mesgListener: (mesgNum, message) => ordered.push({mesgNum, message})
-    });
-    if (result.errors?.length) throw new Error('FIT decoding reported: ' + result.errors.join('; '));
-    const encoder = new Encoder();
-    let removedGps = 0, removedPrivate = 0, written = 0, skipped = 0;
-    const devIds = {};
-    for (const item of ordered) {
-      const type = Profile.types?.mesgNum?.[item.mesgNum] || '';
-      if ($('personal').checked && type === 'userProfile') { removedPrivate++; continue; }
-      const clean = cleanMessage(item.mesgNum, item.message, Profile, $('gps').checked, $('personal').checked);
-      if (!clean) continue;
-      if ($('gps').checked) {
-        for (const k of gpsFields) if (Object.prototype.hasOwnProperty.call(item.message,k) && !Object.prototype.hasOwnProperty.call(clean,k)) removedGps++;
+const p2 = n => String(n).padStart(2, '0');
+function anonymizeBuffer(sdk, buffer, removeGps, removePersonal) {
+  const {Decoder, Encoder, Stream, Profile} = sdk;
+  const input = new Decoder(Stream.fromArrayBuffer(buffer));
+  if (!input.isFIT() || !input.checkIntegrity()) throw new Error('Not a valid FIT file, or its checksum failed.');
+  const ordered = [];
+  // Scaled values (the Encoder re-applies scaling); sub-fields/components unexpanded; unknown fields kept.
+  const result = input.read({
+    applyScaleAndOffset: true, expandSubFields: false, expandComponents: false,
+    convertTypesToStrings: true, convertDateTimesToDates: true,
+    includeUnknownData: true, mergeHeartRates: false,
+    mesgListener: (mesgNum, message) => ordered.push({mesgNum, message})
+  });
+  if (result.errors?.length) throw new Error('FIT decoding reported: ' + result.errors.join('; '));
+  const encoder = new Encoder();
+  let removedGps = 0, removedPrivate = 0, written = 0, skipped = 0;
+  const devIds = {};
+  for (const item of ordered) {
+    const type = Profile.types?.mesgNum?.[item.mesgNum] || '';
+    if (removePersonal && type === 'userProfile') { removedPrivate++; continue; }
+    const clean = cleanMessage(item.mesgNum, item.message, Profile, removeGps, removePersonal);
+    if (!clean) continue;
+    if (removeGps) for (const k of gpsFields) if (k in item.message && !(k in clean)) removedGps++;
+    if (removePersonal) for (const k of privateFields) if (k in item.message && !(k in clean)) removedPrivate++;
+    try {
+      if (item.mesgNum === 207) devIds[clean.developerDataIndex] = clean;
+      encoder.onMesg(item.mesgNum, clean);
+      // Developer fields (e.g. Stryd/Coros app data) must be registered with the encoder.
+      if (item.mesgNum === 206 && devIds[clean.developerDataIndex]) {
+        encoder.addDeveloperField(clean.key, devIds[clean.developerDataIndex], clean);
       }
-      if ($('personal').checked) {
-        for (const k of privateFields) if (Object.prototype.hasOwnProperty.call(item.message,k) && !Object.prototype.hasOwnProperty.call(clean,k)) removedPrivate++;
-      }
-      try {
-        if (item.mesgNum === 207) devIds[clean.developerDataIndex] = clean;
-        encoder.onMesg(item.mesgNum, clean);
-        // Developer fields (e.g. Stryd/Coros app data) must be registered with the encoder.
-        if (item.mesgNum === 206 && devIds[clean.developerDataIndex]) {
-          encoder.addDeveloperField(clean.key, devIds[clean.developerDataIndex], clean);
-        }
-        written++;
-      } catch (err1) {
-        // Retry without unknown (numeric-key) fields; skip the message if it still fails.
-        const known = {};
-        for (const [k, v] of Object.entries(clean)) if (!/^\d+$/.test(k)) known[k] = v;
-        try {
-          encoder.onMesg(item.mesgNum, known);
-          written++;
-        } catch (err2) {
-          skipped++;
-          console.warn('Skipped message', item.mesgNum, type, err2);
-        }
-      }
+      written++;
+    } catch (err1) {
+      // Retry without unknown (numeric-key) fields; skip the message if it still fails.
+      const known = {};
+      for (const [k, v] of Object.entries(clean)) if (!/^\d+$/.test(k)) known[k] = v;
+      try { encoder.onMesg(item.mesgNum, known); written++; }
+      catch (err2) { skipped++; console.warn('Skipped message', item.mesgNum, type, err2); }
     }
-    const output = encoder.close();
-    const outBytes = output instanceof Uint8Array ? output : new Uint8Array(output);
-    const verify = new Decoder(Stream.fromByteArray(Array.from(outBytes)));
-    if (!verify.isFIT() || !verify.checkIntegrity()) throw new Error('The generated file did not pass FIT integrity validation.');
-    const blob = new Blob([outBytes], {type:'application/octet-stream'});
-    const url = URL.createObjectURL(blob);
-    $('download').href = url;
-    // Name the file after the activity start (UTC) so the original filename (often a place name) isn't kept.
-    const pick = n => ordered.find(x => x.mesgNum === n && x.message.startTime instanceof Date)?.message.startTime;
-    const when = pick(18) || pick(19) || ordered.find(x => x.message.timestamp instanceof Date)?.message.timestamp || new Date();
-    const p2 = n => String(n).padStart(2, '0');
-    $('download').download = `${when.getUTCFullYear()}-${p2(when.getUTCMonth()+1)}-${p2(when.getUTCDate())}_${p2(when.getUTCHours())}-${p2(when.getUTCMinutes())}-${p2(when.getUTCSeconds())}.fit`;
-    $('download').textContent = 'Save anonymized .FIT';
-    $('download').classList.remove('hidden');
-    $('status').textContent = `Done. ${written} messages retained; ${removedGps} GPS fields and ${removedPrivate} personal fields/messages removed. Output integrity check passed.` + (skipped ? ` ${skipped} unsupported messages were skipped.` : '');
-    $('status').className = 'small ok';
+  }
+  const output = encoder.close();
+  const bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
+  const verify = new Decoder(Stream.fromByteArray(Array.from(bytes)));
+  if (!verify.isFIT() || !verify.checkIntegrity()) throw new Error('The generated file did not pass FIT integrity validation.');
+  // Name after the activity start (UTC) so the original filename (often a place name) isn't kept.
+  const pick = n => ordered.find(x => x.mesgNum === n && x.message.startTime instanceof Date)?.message.startTime;
+  const when = pick(18) || pick(19) || ordered.find(x => x.message.timestamp instanceof Date)?.message.timestamp || new Date();
+  const name = `${when.getUTCFullYear()}-${p2(when.getUTCMonth()+1)}-${p2(when.getUTCDate())}_${p2(when.getUTCHours())}-${p2(when.getUTCMinutes())}-${p2(when.getUTCSeconds())}`;
+  return {bytes, name, written, removedGps, removedPrivate, skipped};
+}
+// Minimal store-only ZIP writer (no external library needed).
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xFFFFFFFF; for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  const d = new Date(), dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  let offset = 0;
+  for (const f of files) {
+    const nameB = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+    lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true); lh.setUint32(14, crc, true);
+    lh.setUint32(18, size, true); lh.setUint32(22, size, true); lh.setUint16(26, nameB.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), nameB, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
+    ch.setUint16(10, 0, true); ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true); ch.setUint32(16, crc, true);
+    ch.setUint32(20, size, true); ch.setUint32(24, size, true); ch.setUint16(28, nameB.length, true);
+    ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), nameB);
+    offset += 30 + nameB.length + size;
+  }
+  const cdSize = central.reduce((a, b) => a + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], {type: 'application/zip'});
+}
+// ==/core==
+
+$('file').addEventListener('change', () => {
+  selected = Array.from($('file').files || []);
+  $('go').disabled = !selected.length;
+  $('zip').classList.add('hidden');
+  $('bar').classList.add('hidden');
+  $('results').textContent = '';
+  const total = selected.reduce((a, f) => a + f.size, 0);
+  $('status').textContent = selected.length
+    ? `${selected.length} file${selected.length > 1 ? 's' : ''} selected · ${(total/1024).toFixed(1)} KB`
+    : 'Choose files to begin.';
+  $('status').className = 'small';
+});
+
+let sdkPromise = null;
+$('go').addEventListener('click', async () => {
+  if (!selected.length) return;
+  const removeGps = $('gps').checked, removePersonal = $('personal').checked;
+  $('go').disabled = true; $('file').disabled = true;
+  $('zip').classList.add('hidden'); $('results').textContent = '';
+  $('bar').classList.remove('hidden'); $('bar').firstElementChild.style.width = '0';
+  $('status').className = 'small';
+  $('status').textContent = 'Loading FIT tools…';
+  const outputs = [], used = new Set();
+  let okCount = 0, failCount = 0;
+  try {
+    sdkPromise ||= import('https://esm.sh/@garmin/fitsdk');
+    const sdk = await sdkPromise;
+    for (let i = 0; i < selected.length; i++) {
+      const file = selected[i];
+      $('status').textContent = `Processing ${i + 1} of ${selected.length}…`;
+      await new Promise(r => setTimeout(r, 0)); // let the UI repaint between files
+      const row = document.createElement('div');
+      row.className = 'row';
+      const label = document.createElement('div');
+      label.className = 'name';
+      label.textContent = file.name;
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      label.appendChild(meta);
+      row.appendChild(label);
+      try {
+        const r = anonymizeBuffer(sdk, await file.arrayBuffer(), removeGps, removePersonal);
+        let name = r.name + '.fit', n = 2;
+        while (used.has(name)) name = `${r.name}_${n++}.fit`;
+        used.add(name);
+        outputs.push({name, data: r.bytes});
+        const a = document.createElement('a');
+        a.className = 'save'; a.textContent = 'Save';
+        a.href = URL.createObjectURL(new Blob([r.bytes], {type: 'application/octet-stream'}));
+        a.download = name;
+        row.classList.add('ok');
+        meta.textContent = `→ ${name} · ${r.written} messages kept, ${r.removedGps} GPS and ${r.removedPrivate} personal items removed` + (r.skipped ? `, ${r.skipped} skipped` : '');
+        row.appendChild(a);
+        okCount++;
+      } catch (e) {
+        row.classList.add('fail');
+        meta.textContent = 'Could not anonymize: ' + (e?.message || String(e));
+        failCount++;
+      }
+      $('results').appendChild(row);
+      $('bar').firstElementChild.style.width = `${Math.round((i + 1) / selected.length * 100)}%`;
+    }
+    $('status').textContent = `Done. ${okCount} anonymized` + (failCount ? `, ${failCount} failed` : '') + '. Integrity check passed on every saved file.';
+    $('status').className = failCount && !okCount ? 'small err' : 'small ok';
+    if (outputs.length > 1) {
+      $('zip').href = URL.createObjectURL(makeZip(outputs));
+      $('zip').textContent = `Save all ${outputs.length} as .zip`;
+      $('zip').classList.remove('hidden');
+    }
   } catch (e) {
-    $('status').textContent = 'Could not anonymize this file: ' + (e?.message || String(e)) + '\nTry another FIT file or share the error so the tool can be improved.';
+    $('status').textContent = 'Could not start: ' + (e?.message || String(e)) + '\nCheck your internet connection (the FIT SDK loads from a CDN) and try again.';
     $('status').className = 'small err';
   } finally {
-    $('go').disabled = !selected;
+    $('go').disabled = !selected.length; $('file').disabled = false;
   }
 });
 </script>
